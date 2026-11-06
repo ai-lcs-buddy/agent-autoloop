@@ -71,7 +71,7 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 
 从 [hello-channel/channel.ts](../examples/plugins/hello-channel/channel.ts) 开始。它把卡片写进文件，用命令行回答。
 
-默认导出异步函数，参数是 `{ hub, options, log, signal }`；`options` 来自 `config.json`，不含中台密钥。
+默认导出异步函数，参数是 `{ hub, options, log, signal, url }`；`options` 来自 `config.json`，不含中台密钥。`url` 是中台地址，供把外部互动带回中台的通道用：飞书通道用它和自己的来源密钥，把本人对机器人的私聊发回成事件。
 
 | 调用                                  | 作用                                      |
 | ------------------------------------- | ----------------------------------------- |
@@ -91,6 +91,8 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 能收回调的通道要在规则里设置 `answerers`，没设时通道里谁都能回答，`doctor` 会提醒；只能发文字的通道设置 `links: true`，发送 `card.link`。拿到链接的人能回答这张卡片。
 
 通道和中台共用一个 Node 进程，外部调用应异步等待。内置飞书通道的用户查询、发送和更新均异步调用 CLI，发送期间中台仍能接收事件和心跳。
+
+飞书通道另带一个收件箱：在 `config.json` 的飞书通道里加 `"sourceKey"`（`agent-autoloop key new source feishu` 新建的来源密钥），它就把本人对机器人的私聊变成 `im.message` 事件投进中台，规则按 `{ "source": "feishu", "types": ["im.message"] }` 接单，回答仍走卡片。别人发的、群聊里的消息不会变成事件；不配 `sourceKey` 就不开。
 
 ## 事件插件
 

@@ -24,6 +24,8 @@ export type ChannelContext = {
   options: Record<string, unknown>;
   log: (line: string) => void;
   signal: AbortSignal;
+  /** Where the hub is, for a channel that also brings things back (Feishu's inbox uses a source key of its own). */
+  url?: string;
 };
 
 export async function loadChannel(use: string) {
