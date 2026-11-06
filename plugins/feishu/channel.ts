@@ -1,12 +1,17 @@
-// Feishu (Lark), through the official lark-cli: it holds the app's credentials and the long connection that brings
-// clicks back, so this machine needs no public address. Only one listener can hold an app's card clicks, so run this in
-// one place.
+// Feishu (Lark), through the official lark-cli: it holds the app's credentials and the long connections that bring
+// clicks and the owner's private-chats back, so this machine needs no public address. Only one listener can hold an
+// app's card clicks, so run this in one place.
 //   "channels": { "feishu": { "key": "…", "user": "ou_xxx" } } in config.json
 //   "channels": { "feishu": { "name": "飞书", "answerers": ["ou_xxx"] } } in rules.json: who may answer.
+// The inbox is off unless config.json also has "sourceKey": a source key (agent-autoloop key new source feishu). With
+// it, the owner's p2p words to the bot come back to the hub as `im.message` events under that source; a rule such as
+// { "when": { "source": "feishu", "types": ["im.message"] } } hands them to an agent and the answer returns as a card.
+// Messages from anyone else, or from group chats, never become events.
 import { execFile, spawn } from "node:child_process";
 import type { Card, ChannelContext } from "../../host/channels.ts";
 import { eachLine } from "../../host/lines.ts";
 import { commandLine } from "../../host/command.ts";
+import { hubClient } from "../../protocol/client.ts";
 
 /** Feishu sends these values as JSON in a string, which may be empty. */
 function safeJson(text: unknown): any {
@@ -100,7 +105,7 @@ export function render(card: Card) {
   };
 }
 
-export default async function feishu({ hub, options, log, signal }: ChannelContext) {
+export default async function feishu({ hub, options, log, signal, url }: ChannelContext) {
   const program = (options.lark as string | undefined) ?? "lark-cli";
   const lark = async (args: string[], input?: string) => {
     const printed = await new Promise<string>((resolve, reject) => {
@@ -204,26 +209,84 @@ export default async function feishu({ hub, options, log, signal }: ChannelConte
     log(`card ${cardId}: ${how} by ${event.operator_id}, ${answer.changed ? "counted" : "already settled"}`);
   }
 
-  async function listen() {
+  /** One long-lived lark-cli consume: lines to a handler, restarts however it stops, a start failure is said only. */
+  async function consume(key: string, label: string, onLine: (line: string) => Promise<void>) {
     while (!signal.aborted) {
       // stdin stays open: lark-cli ends an unbounded consume when its stdin closes.
-      const consume = spawn(...commandLine([program, "event", "consume", "card.action.trigger", "--as", "bot"]), {
+      // commandLine: Windows finds the program itself (upstream #163); key: which long connection this consume holds.
+      const child = spawn(...commandLine([program, "event", "consume", key, "--as", "bot"]), {
         stdio: ["pipe", "pipe", "pipe"],
       });
       // Unheard, this would end the whole hub. A process that never started still closes, which starts it again below.
-      consume.on("error", (error) => log(`the click listener couldn't run: ${error}`));
-      const stop = () => consume.kill();
+      child.on("error", (error) => log(`the ${label} listener couldn't run: ${error}`));
+      const stop = () => child.kill();
       signal.addEventListener("abort", stop);
-      eachLine(consume.stderr, log);
-      eachLine(consume.stdout, (line) => void clicked(line).catch((error) => log(`click not handled: ${error}`)));
-      await new Promise((resolve) => consume.on("close", resolve));
+      eachLine(child.stderr, log);
+      eachLine(child.stdout, (line) => void onLine(line).catch((error) => log(`${label}: not handled: ${error}`)));
+      await new Promise((resolve) => child.on("close", resolve));
       signal.removeEventListener("abort", stop);
       if (!signal.aborted) {
-        log("the click listener stopped; starting it again in 10 seconds");
+        log(`the ${label} listener stopped; starting it again in 10 seconds`);
         await new Promise((resolve) => setTimeout(resolve, 10_000));
       }
     }
   }
 
-  await Promise.all([deliver(), listen()]);
+  const sourceKey = typeof options.sourceKey === "string" ? options.sourceKey : "";
+  const door = sourceKey && url ? hubClient(url, sourceKey) : null;
+
+  const KINDS: Record<string, string> = {
+    image: "图片",
+    file: "文件",
+    audio: "语音",
+    media: "视频",
+    post: "富文本",
+    sticker: "表情",
+  };
+
+  /** lark-cli pre-renders a message's words to plain text; nothing readable keeps a plain placeholder instead. */
+  function wordsOf(message: any): { summary: string; detail: string } {
+    const words = typeof message?.content === "string" ? message.content.trim() : "";
+    if (words) return { summary: words.slice(0, 200), detail: words.slice(0, 4000) };
+    return { summary: `[${KINDS[message?.message_type] ?? String(message?.message_type ?? "消息")}]`, detail: "" };
+  }
+
+  /** Only the owner's own p2p words reach the hub; anyone else's, and every group chat, never becomes an event. */
+  async function incoming(line: string) {
+    // lark-cli's im.message.receive_v1 is flat: message_id, chat_type, message_type, sender_id, pre-rendered content.
+    const update = JSON.parse(line);
+    if (typeof update.message_id !== "string") return;
+    if (update.chat_type !== "p2p") return;
+    if (update.sender_id !== owner) return;
+    const { summary, detail } = wordsOf(update);
+    // The subject is the lane and only ASCII is allowed (protocol/validate.ts); a p2p chat's id is both.
+    const subject =
+      String(update.chat_id ?? "p2p")
+        .replace(/[^A-Za-z0-9#._:/@-]/g, "-")
+        .slice(0, 100) || "p2p";
+    const answer = await door!.event({
+      id: update.message_id,
+      type: "im.message",
+      subject,
+      summary,
+      detail,
+    });
+    log(
+      `message ${update.message_id}: ${
+        answer.duplicate
+          ? "already had it"
+          : answer.routed.length
+            ? `handed to ${answer.routed.join("、")}`
+            : "no rule took it"
+      }`,
+    );
+  }
+
+  /** The owner's DMs with the bot, brought back as events; off without a source key or the hub's address. */
+  async function inbox() {
+    if (!door) return;
+    await consume("im.message.receive_v1", "inbox", incoming);
+  }
+
+  await Promise.all([deliver(), consume("card.action.trigger", "click", clicked), inbox()]);
 }

@@ -53,7 +53,7 @@ function keepChannelRunning(id: string, { use, key, ...options }: ChannelConfig,
     say,
     async () => {
       const start = await loadChannel(use ?? id);
-      await start({ hub: hubClient(url, key), options, log: say, signal });
+      await start({ hub: hubClient(url, key), options, log: say, signal, url });
     },
     signal,
   );
